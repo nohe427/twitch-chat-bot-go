@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,10 +33,15 @@ type TokenExchangeResponse struct {
 	RefreshToken string   `json:"refresh_token"`
 	Scope        []string `json:"scope"`
 	TokenType    string   `json:"token_type"`
+	Status       int64    `json:"status"`
+	Message      string   `json:"message"`
 }
 
 func main() {
-	CreateAuthExchange()
+	_, err := CreateAuthExchange()
+	if err != nil {
+		fmt.Printf("ERROR %v", err)
+	}
 
 }
 
@@ -88,24 +95,65 @@ func CreateAuthExchange() (*AuthData, error) {
 	ad.startLocalAuthServer()
 	ad.navigateToAuthURL()
 	ad.Waitgroup.Wait()
+	if ad.TokenExchangeResponse == nil {
+		return nil, fmt.Errorf("Token exchange response failure")
+	}
+	err = WriteTokenToDisk(ad.TokenExchangeResponse)
+	if err != nil {
+		return nil, err
+	}
 
 	return ad, nil
 }
 
+func getTokenFile() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("could not find the home dir for the user")
+	}
+	configDir := filepath.Join(home, ".config", "nohedevtwitchbot")
+	err = os.MkdirAll(configDir, fs.FileMode(0750))
+	if err != nil {
+		return "", fmt.Errorf("could not create the configuration directory for nohedevtwitchbot")
+	}
+	tokenFile := "token.json"
+	return filepath.Join(configDir, tokenFile), nil
+}
+
+func WriteTokenToDisk(ter *TokenExchangeResponse) error {
+	tokenFile, err := getTokenFile()
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(tokenFile)
+	defer f.Close()
+	if err != nil {
+		return fmt.Errorf("could not create the token.json file at location %s : %v", tokenFile, err)
+	}
+	b, err := json.Marshal(ter)
+	if err != nil {
+		return fmt.Errorf("could not marshal the json file to bytes : %v", err)
+	}
+	_, err = f.Write(b)
+
+	return err
+}
+
 type AuthData struct {
-	Waitgroup    *sync.WaitGroup
-	State        string
-	RedirectUri  string
-	ClientId     string
-	ClientSecret string
-	AuthCode     string
-	Server       *http.Server
+	Waitgroup             *sync.WaitGroup
+	State                 string
+	RedirectUri           string
+	ClientId              string
+	ClientSecret          string
+	AuthCode              string
+	Server                *http.Server
+	TokenExchangeResponse *TokenExchangeResponse
 }
 
 // navigates to an auth URL for twitch and then returns an auth code inside
 // the AuthData struct
 func (ad *AuthData) navigateToAuthURL() {
-	scope := "" // Space delimited list of scopes
+	scope := "user:manage:whispers" // Space delimited list of scopes
 
 	url := fmt.Sprintf("%s?client_id=%s&response_type=code&redirect_uri=%s&scope=%s&state=%s", TWITCH_AUTH_URL, ad.ClientId, ad.RedirectUri, scope, ad.State)
 
@@ -130,25 +178,56 @@ func (ad *AuthData) recieveAuthorizationCodes(w http.ResponseWriter, r *http.Req
 	b := bytes.NewBufferString(msg)
 	w.Write(b.Bytes())
 	w.(http.Flusher).Flush()
+	_, err := ad.exchangeForToken(false)
+	if err != nil {
+		log.Fatalf("token exchange failed, giving up : %v", err)
+	}
 	ad.Server.Shutdown(ctx)
 	ad.Waitgroup.Done()
 
 	//Once we have the auth code, shut down the server
 }
 
-func (ad *AuthData) exchangeForToken() (*TokenExchangeResponse, error) {
-	data := &url.Values{}
-	data.Set("client_id", ad.ClientId)
-	data.Set("client_secret", ad.ClientSecret)
-	data.Set("code", ad.AuthCode)
-	data.Set("grant_type", "authorization_code")
-	data.Set("redirect_uri", ad.RedirectUri)
+func getRefreshToken() (string, error) {
+	tokenFile, err := getTokenFile()
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("token file unable to be read %v", err)
+	}
+	ter := &TokenExchangeResponse{}
+	err = json.Unmarshal(b, ter)
+	return ter.RefreshToken, err
+}
+
+func (ad *AuthData) exchangeForToken(isRefresh bool) (*TokenExchangeResponse, error) {
+	data := &url.Values{
+		"client_id":     {ad.ClientId},
+		"client_secret": {ad.ClientSecret},
+		"code":          {ad.AuthCode},
+		"grant_type":    {"authorization_code"},
+		"redirect_uri":  {ad.RedirectUri},
+	}
+	if isRefresh {
+		refreshToken, err := getRefreshToken()
+		if err != nil {
+			return nil, err
+		}
+		data = &url.Values{
+			"client_id":     {ad.ClientId},
+			"client_secret": {ad.ClientSecret},
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {refreshToken},
+		}
+	}
 
 	req, err := http.NewRequest("POST", TWITCH_TOKEN_URL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("could not create a request : %v", err)
 	}
-	req.Header.Set("Content-Type", "x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("could not complete request to exchange the token : %v", err)
@@ -161,13 +240,15 @@ func (ad *AuthData) exchangeForToken() (*TokenExchangeResponse, error) {
 		return nil, fmt.Errorf("could not read resp body into bytes : %v", err)
 	}
 	err = json.Unmarshal(bb, ter)
+	if ter.Message != "" {
+		fmt.Printf("Error Message %v", ter.Message)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("JSON unmarshal failed of token exchange response: %v", err)
 	}
+	ad.TokenExchangeResponse = ter
 	return ter, nil
 }
 
-//TODO: Refresh Tokens https://dev.twitch.tv/docs/authentication/refresh-tokens/
-//TODO: Write the user token to the application cache. Maybe $HOME/.config/
 //TODO: Refactor all of auth to a package inside this package
 //TODO: Rename package to match the Git Repo
