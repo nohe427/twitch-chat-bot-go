@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -26,6 +27,68 @@ const TWITCH_CLIENT_ID string = "TWITCH_CLIENT_ID"
 const TWITCH_CLIENT_SECRET string = "TWITCH_CLIENT_SECRET"
 const TWITCH_AUTH_URL string = "https://id.twitch.tv/oauth2/authorize"
 const TWITCH_TOKEN_URL string = "https://id.twitch.tv/oauth2/token"
+const TWITCH_VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
+const USER_CHANNEL_CHAT_RECIEVED_EVENT = "channel.chat.message"
+const USER_CHANNEL_CHAT_RECIEVED_EVENT_VERSION = 1
+const EVENTSUB_SUBSCRIPTIONS_URL = "https://api.twitch.tv/helix/eventsub/subscriptions"
+
+// TODO: Figure this out later so we can have multiple Conditions
+type Condition struct{}
+
+type ChannelChatMessageCondition struct {
+	BroadcastUserID string `json:"broadcaster_user_id"`
+	UserId          string `json:"user_id"`
+}
+
+type Transport struct {
+	Method    string `json:"method"`
+	SessionId string `json:"session_id"`
+}
+
+type CreateSubscriptionRequest struct {
+	Type      string    `json:"type"`
+	Version   int64     `json:"version"`
+	Condition Condition `json:"condition"`
+	Transport Transport `json:"transport"`
+	Method    string    `json:"method"`
+	SessionId string    `json:"session_id"`
+}
+
+func createChatSubscription(ad *AuthData) error {
+	csr := &CreateSubscriptionRequest{
+		Type:      USER_CHANNEL_CHAT_RECIEVED_EVENT,
+		Version:   USER_CHANNEL_CHAT_RECIEVED_EVENT_VERSION,
+		Condition: Condition{}, //TODO: Fill in later
+		Transport: Transport{}, //TODO: Fill in later
+		Method:    "websocket",
+		SessionId: "", //TODO: Fill in later
+	}
+	b, err := json.Marshal(csr)
+	if err != nil {
+		return fmt.Errorf("cannot createsubscriptionrequest jsonStr : %v", err)
+	}
+	buf := bytes.NewBuffer(b)
+	req, err := http.NewRequest("POST", EVENTSUB_SUBSCRIPTIONS_URL, buf)
+	if err != nil {
+		return fmt.Errorf("cannot create new request : %v", err)
+	}
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", ad.TokenExchangeResponse.AccessToken))
+	req.Header.Add("Client-Id", ad.ClientId)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cannot send request : %v", err)
+	}
+	body := resp.Body
+	defer body.Close()
+	bb, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("cannot read body bytes : %v", err)
+	}
+	fmt.Printf("body results %v", string(bb))
+	return nil
+	//TODO: Start the web socket connection so you can get the condition and transport
+}
 
 type TokenExchangeResponse struct {
 	AccessToken  string   `json:"access_token"`
@@ -75,8 +138,28 @@ func (ad *AuthData) startLocalAuthServer() {
 	fmt.Printf("LISTENING ON : %s\n", ad.RedirectUri)
 }
 
-func CreateAuthExchange() (*AuthData, error) {
+func (ad *AuthData) loadTokenFromDisk() error {
+	tokenFile, err := getTokenFile()
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(tokenFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err != nil {
+		return fmt.Errorf("token file unable to be read %v", err)
+	}
+	ter := &TokenExchangeResponse{}
+	err = json.Unmarshal(b, ter)
+	if err != nil {
+		return fmt.Errorf("could not load token from disk: %v", err)
+	}
+	ad.TokenExchangeResponse = ter
+	return nil
+}
 
+func CreateAuthExchange() (*AuthData, error) {
 	cid, ok := os.LookupEnv(TWITCH_CLIENT_ID)
 	if !ok {
 		return nil, fmt.Errorf("Env var %s not set", TWITCH_CLIENT_ID)
@@ -90,20 +173,57 @@ func CreateAuthExchange() (*AuthData, error) {
 		return nil, fmt.Errorf("Cannot generate state string")
 	}
 	ad := &AuthData{ClientId: cid, ClientSecret: cs, State: stateStr}
-	ad.Waitgroup = &sync.WaitGroup{}
-	ad.Waitgroup.Add(1)
-	ad.startLocalAuthServer()
-	ad.navigateToAuthURL()
-	ad.Waitgroup.Wait()
-	if ad.TokenExchangeResponse == nil {
-		return nil, fmt.Errorf("Token exchange response failure")
+	err = ad.loadTokenFromDisk()
+	if errors.Is(err, fs.ErrNotExist) {
+		ad.Waitgroup = &sync.WaitGroup{}
+		ad.Waitgroup.Add(1)
+		ad.startLocalAuthServer()
+		ad.navigateToAuthURL()
+		ad.Waitgroup.Wait()
+		if ad.TokenExchangeResponse == nil {
+			return nil, fmt.Errorf("Token exchange response failure")
+		}
+		err = WriteTokenToDisk(ad.TokenExchangeResponse)
+		if err != nil {
+			return nil, err
+		}
+		return ad, nil
 	}
-	err = WriteTokenToDisk(ad.TokenExchangeResponse)
+
+	ok, err = ad.validateAccessToken()
 	if err != nil {
 		return nil, err
 	}
-
+	if !ok {
+		fmt.Printf("attempting to refresh the token\n")
+		ter, err := ad.exchangeForToken(true)
+		if err != nil {
+			return nil, fmt.Errorf("could not exchange refresh token %v\n", err)
+		}
+		ad.TokenExchangeResponse = ter
+		err = WriteTokenToDisk(ter)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return ad, nil
+}
+
+func (ad *AuthData) validateAccessToken() (bool, error) {
+	req, err := http.NewRequest("GET", TWITCH_VALIDATE_URL, nil)
+	if err != nil {
+		return false, fmt.Errorf("Request could not be generated")
+	}
+	req.Header.Add("Authorization", fmt.Sprintf("OAuth %s", ad.TokenExchangeResponse.AccessToken))
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("could not send request : %v", err)
+	}
+	if res.StatusCode == 401 {
+		fmt.Printf("access token no longer valid, please refresh")
+		return false, nil
+	}
+	return true, nil
 }
 
 func getTokenFile() (string, error) {
@@ -153,7 +273,7 @@ type AuthData struct {
 // navigates to an auth URL for twitch and then returns an auth code inside
 // the AuthData struct
 func (ad *AuthData) navigateToAuthURL() {
-	scope := "user:manage:whispers" // Space delimited list of scopes
+	scope := "channel:bot user:read:chat user:write:chat user:manage:whispers" // Space delimited list of scopes
 
 	url := fmt.Sprintf("%s?client_id=%s&response_type=code&redirect_uri=%s&scope=%s&state=%s", TWITCH_AUTH_URL, ad.ClientId, ad.RedirectUri, scope, ad.State)
 
@@ -188,18 +308,11 @@ func (ad *AuthData) recieveAuthorizationCodes(w http.ResponseWriter, r *http.Req
 	//Once we have the auth code, shut down the server
 }
 
-func getRefreshToken() (string, error) {
-	tokenFile, err := getTokenFile()
-	if err != nil {
-		return "", err
+func (ad *AuthData) getRefreshToken() (string, error) {
+	if ad.TokenExchangeResponse.RefreshToken == "" {
+		return "", fmt.Errorf("could not find token on disk")
 	}
-	b, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return "", fmt.Errorf("token file unable to be read %v", err)
-	}
-	ter := &TokenExchangeResponse{}
-	err = json.Unmarshal(b, ter)
-	return ter.RefreshToken, err
+	return ad.TokenExchangeResponse.RefreshToken, nil
 }
 
 func (ad *AuthData) exchangeForToken(isRefresh bool) (*TokenExchangeResponse, error) {
@@ -211,7 +324,7 @@ func (ad *AuthData) exchangeForToken(isRefresh bool) (*TokenExchangeResponse, er
 		"redirect_uri":  {ad.RedirectUri},
 	}
 	if isRefresh {
-		refreshToken, err := getRefreshToken()
+		refreshToken, err := ad.getRefreshToken()
 		if err != nil {
 			return nil, err
 		}
